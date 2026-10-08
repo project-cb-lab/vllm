@@ -173,18 +173,28 @@ class CPUOffloadingSpec(OffloadingSpec):
         # num_chunks == 0 would size the region to zero bytes, which cannot be
         # mmap'd; fall back to the tensor path (empty tensors) as before.
         if self._uses_shared_region() and self.num_chunks > 0:
-            # Replicated layout puts all ranks on slot 0 (single MLA copy) and
-            # splits pre-faulting across them; otherwise each rank takes its
-            # own slot by physical device index.
+            # Replicated layout puts all ranks on slot 0 (single MLA copy) of one
+            # region and splits pre-faulting across them. Otherwise ranks never
+            # read each other's slots, so each gets its own region, with no peers
+            # to wait for before unlinking it.
             world_size = self.config.parallel.world_size
             worker_index = torch.accelerator.current_device_index() % world_size
+            engine_id = self.config.engine_id
+            row_bytes = self.kv_bytes_per_chunk
+            if not self.replicated_layout:
+                engine_id += f"_{worker_index}"
+                row_bytes = round_up(
+                    self.cpu_page_size_per_worker, self.BLOCK_SIZE_ALIGNMENT
+                )
             mmap_region = SharedOffloadRegion(
-                engine_id=self.config.engine_id,
+                engine_id=engine_id,
                 num_chunks=self.num_chunks,
-                rank=0 if self.replicated_layout else worker_index,
-                kv_bytes_per_chunk=self.kv_bytes_per_chunk,
+                rank=0,
+                kv_bytes_per_chunk=row_bytes,
                 cpu_page_size=self.cpu_page_size_per_worker,
-                barrier=_all_workers_barrier,
+                barrier=(
+                    _all_workers_barrier if self.replicated_layout else lambda: None
+                ),
                 populate_shard=(
                     (worker_index, world_size) if self.replicated_layout else None
                 ),
