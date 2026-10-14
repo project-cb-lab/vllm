@@ -145,7 +145,6 @@ class FakeNixlWrapper:
     def __init__(self, agent_name: str, *args, **kwargs):
         self._cycles_before_xfer_done = 0
         self._check_xfer_state_cycles: defaultdict[int, int] = defaultdict(lambda: 0)
-        self.invalid_remote_agents: set[str] = set()
 
     def get_reg_descs(self, caches_data, memory_type: str) -> list:
         return [str(uuid.uuid4()) for _ in caches_data]
@@ -166,7 +165,6 @@ class FakeNixlWrapper:
         return self.AGENT_METADATA
 
     def add_remote_agent(self, agent_metadata: bytes) -> str:
-        self.invalid_remote_agents.discard(self.REMOTE_AGENT_NAME)
         return self.REMOTE_AGENT_NAME
 
     def get_new_notifs(self) -> dict[str, list[bytes]]:
@@ -187,9 +185,6 @@ class FakeNixlWrapper:
 
     def remove_remote_agent(self, agent: str) -> None:
         pass
-
-    def check_remote_metadata(self, agent: str) -> bool:
-        return agent not in self.invalid_remote_agents
 
     def send_notif(self, agent_name: str, notif_msg: bytes) -> None:
         pass
@@ -2176,6 +2171,7 @@ def test_mixed_memory_local_descriptors_split_by_memory_type():
 def recv_worker():
     """Receive lifecycle state without distributed or device initialization."""
     worker = object.__new__(NixlConnectorWorker)
+    worker.kv_cache_config = make_kv_cache_config(block_size=16)
     worker.transfer_topo = MagicMock()
     worker.transfer_topo.block_size_ratio.return_value = 1
     worker.transfer_topo.get_engine_info.return_value = SimpleNamespace(
@@ -2962,7 +2958,6 @@ class TestPeerReplacement:
 
     def _fail_old_peer(self):
         self.worker.start_load_kv(self._request("old"))
-        self.nixl.invalid_remote_agents.add("old")
         self.transport.check_xfer_state.return_value = "ERR"
 
     def test_cleans_old_peer_after_confirmed_handshake(self):
@@ -3014,12 +3009,7 @@ class TestPeerReplacement:
         ],
         ids=["healthy", "failed-sibling-completes", "failed-sibling-fails"],
     )
-    @pytest.mark.parametrize("invalidated", [False, True])
-    def test_waits_for_reads_before_cleanup_and_failure_reporting(
-        self, states, failed, invalidated
-    ):
-        if invalidated:
-            self.nixl.invalid_remote_agents.add("old")
+    def test_waits_for_reads_before_cleanup_and_failure_reporting(self, states, failed):
         self.worker._recving_metadata.update(self._request("old").reqs_to_recv)
         self.worker._recving_transfers["old-req"] = [1, 2] if failed else [1]
         self.transport.check_xfer_state.side_effect = states
@@ -3068,7 +3058,6 @@ class TestPeerReplacement:
         self.worker._ensure_handshake("other", "other-host", 1234, 1)
         self.worker.get_transfer_results()
         self.transport.remove_remote_agent.assert_not_called()
-        self.transport.check_remote_metadata.assert_not_called()
 
         self._connect("other", host="other-host")
         self.worker.get_transfer_results()
@@ -3091,22 +3080,20 @@ class TestPeerReplacement:
         assert "old" in self.worker._handshake_futures
         self.transport.send_notif.assert_not_called()
 
-    @pytest.mark.parametrize("missing", [False, True, RuntimeError("probe failed")])
-    def test_recovery_requires_confirmed_missing_metadata(self, missing):
+    def test_failed_read_releases_peer_with_loaded_metadata(self):
+        # The connection to a peer can stay failed while its metadata stays
+        # loaded, so a failed read releases every rank of the peer.
         self._fail_old_peer()
-        # A missing rank suffices even if another rank still has metadata.
         self.worker._remote_agents["old"][(0, 1)] = "old-other-rank"
-        self.nixl.invalid_remote_agents.clear()
-        if missing is True:
-            self.nixl.invalid_remote_agents.add("old-other-rank")
-        elif isinstance(missing, Exception):
-            self.transport.check_remote_metadata.side_effect = missing
 
         result = self.worker.get_transfer_results()
         assert result.finished_recving == result.failed_recving == {"old-req"}
         assert self.worker.get_block_ids_with_load_errors() == {1}
-        assert ("old" not in self.worker._remote_agents) is (missing is True)
-        assert self.transport.release_dlist_handle.call_count == (missing is True)
+        assert "old" not in self.worker._remote_agents
+        assert self.transport.release_dlist_handle.call_count == 1
+        self.transport.remove_remote_agent.assert_has_calls(
+            [call("old"), call("old-other-rank")], any_order=True
+        )
 
     @pytest.mark.parametrize("handshake_fails", [False, True])
     def test_recovery_rehandshakes_same_id_with_fresh_descriptors(
@@ -3153,7 +3140,6 @@ class TestPeerReplacement:
         self.worker._recving_transfers.update(
             {"old-req": [10, 11], "healthy-req": [12]}
         )
-        self.nixl.invalid_remote_agents.add("old")
         self.transport.check_xfer_state.side_effect = (
             lambda h: "ERR" if h == 10 else "PROC"
         )
@@ -3221,7 +3207,7 @@ class TestPeerReplacement:
         self.transport.remove_remote_agent.assert_called_once_with("old")
 
     @pytest.mark.parametrize("expired", [False, True])
-    def test_success_and_expiry_do_not_probe_metadata(self, expired):
+    def test_success_and_expiry_keep_peer(self, expired):
         metadata = self._request("old")
         if expired:
             metadata.reqs_to_recv["old-req"].remote.blocks_expiry_time = 0.0
@@ -3236,7 +3222,6 @@ class TestPeerReplacement:
             assert result.failed_recving == ({"old-req"} if expired else set())
             assert expiry.call_count == int(expired)
             failure.assert_not_called()
-        self.transport.check_remote_metadata.assert_not_called()
         self.transport.remove_remote_agent.assert_not_called()
 
     @pytest.mark.parametrize("awaiting_kvs", [False, True])
@@ -3764,10 +3749,11 @@ def test_handshake_failure_returns_finished(default_vllm_config, dist_init):
     FailingNixlWrapper,
 )
 @pytest.mark.parametrize("is_hma", [False, True])
+@pytest.mark.parametrize("multiple_kv_cache_groups", [False, True])
 def test_transfer_setup_failure_returns_finished(
-    default_vllm_config, dist_init, is_hma
+    default_vllm_config, dist_init, is_hma, multiple_kv_cache_groups
 ):
-    """Setup failures report the request; only non-HMA reports block IDs."""
+    """Setup failures report the request; block IDs only with one group."""
     block_size = maybe_update_block_size(16)
     vllm_config = create_vllm_config(block_size=block_size)
 
@@ -3781,6 +3767,17 @@ def test_transfer_setup_failure_returns_finished(
     )
     connector.connector_worker.nixl_wrapper.fail_transfer_setup = True
     connector.connector_worker._is_hma_required = is_hma
+    if multiple_kv_cache_groups:
+        # HiSparse adds groups that take no part in the transfer.
+        kv_cache_config = make_kv_cache_config(block_size=block_size)
+        kv_cache_config.kv_cache_groups.append(
+            KVCacheGroupSpec(
+                ["hisparse0"],
+                kv_cache_config.kv_cache_groups[0].kv_cache_spec,
+                enable_kv_transfer=False,
+            )
+        )
+        connector.connector_worker.kv_cache_config = kv_cache_config
 
     request_id = "test_transfer_fail"
     metadata = NixlConnectorMetadata()
@@ -3815,7 +3812,8 @@ def test_transfer_setup_failure_returns_finished(
     assert request_id in results.finished_recving
     assert results.failed_recving == {request_id}
     invalid_blocks = connector.get_block_ids_with_load_errors()
-    assert invalid_blocks == (set() if is_hma else {7, 8, 9})
+    reports_blocks = not is_hma and not multiple_kv_cache_groups
+    assert invalid_blocks == ({7, 8, 9} if reports_blocks else set())
 
 
 class _ScriptedXferWrapper(FakeNixlWrapper):
