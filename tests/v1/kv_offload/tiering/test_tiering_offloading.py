@@ -11,7 +11,7 @@ These tests verify:
 """
 
 from collections.abc import Iterable
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
@@ -39,6 +39,7 @@ from vllm.v1.kv_offload.base import (
     TierMatcher,
     make_offload_key,
 )
+from vllm.v1.kv_offload.cpu.common import CPUOffloadingMetrics
 from vllm.v1.kv_offload.cpu.policies.lru import LRUCachePolicy
 from vllm.v1.kv_offload.tiering.base import (
     JobResult,
@@ -374,6 +375,15 @@ class TestTieringOffloadingManager:
         )
         self.manager._process_finished_jobs()
 
+        stats = self.manager.get_stats()
+        assert stats is not None
+        values = stats.data["data"]
+        assert values[CPUOffloadingMetrics.CPU_CACHE_WRITE_USAGE_PERC][()] == 1.0
+        assert values[CPUOffloadingMetrics.CPU_CACHE_READ_USAGE_PERC][()] == 0.0
+        label = ("1:example",)
+        assert values[TieringOffloadingMetrics.PRIMARY_WRITE_USAGE_PERC][label] == 1.0
+        assert values[TieringOffloadingMetrics.ACTIVE_PROMOTION_JOBS][label] == 1
+        assert values[TieringOffloadingMetrics.PROMOTION_JOB_FAILURES][label] == 1
         assert all(
             self.primary_tier.lookup(key, _CTX) is LookupResult.MISS for key in keys
         )
@@ -394,6 +404,13 @@ class TestTieringOffloadingManager:
             JobResult(job_id=job_id, success=terminal_success)
         )
         self.manager.reset_cache()
+        stats = self.manager.get_stats()
+        assert stats is not None
+        values = stats.data["data"]
+        assert values[CPUOffloadingMetrics.CPU_CACHE_WRITE_USAGE_PERC][()] == 0.0
+        assert values[TieringOffloadingMetrics.PRIMARY_WRITE_USAGE_PERC][label] == 0.0
+        assert values[TieringOffloadingMetrics.ACTIVE_PROMOTION_JOBS][label] == 0
+        assert TieringOffloadingMetrics.PROMOTION_JOB_FAILURES not in values
         assert self.primary_tier.prepare_write(replacement, _CTX) is not None
 
     def test_successful_promotion_finalizes_primary_with_success(self, manager_setup):
