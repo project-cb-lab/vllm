@@ -669,9 +669,6 @@ class P2PSecondaryTierManager(SecondaryTierManager):
         warned = False
         while True:
             self._poll_once()
-            pending = any(s.has_pending_work for s in self._sessions.values())
-            if not pending:
-                return
             latest_safety = {
                 result.job_id: result.memory_safe for result in self._finished_jobs
             }
@@ -680,6 +677,9 @@ class P2PSecondaryTierManager(SecondaryTierManager):
                     "Cannot drain P2P jobs while remote WRITEs may still target "
                     "quarantined slots."
                 )
+            pending = any(s.has_pending_work for s in self._sessions.values())
+            if not pending:
+                return
             if not warned and time.monotonic() - start > 5.0:
                 logger.warning(
                     "P2PSecondaryTierManager.drain_jobs: still draining "
