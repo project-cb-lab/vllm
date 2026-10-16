@@ -1416,7 +1416,7 @@ class OffloadingConnectorScheduler:
         }
         for req_id, entries in handoffs.items():
             req_status = self._req_status.get(req_id)
-            if req_status is None:
+            if req_status is None or req_status.finished_signaled:
                 continue
             req = req_status.req
             max_boundary = self._calc_num_offloadable_tokens(req_status, req.num_tokens)
@@ -1498,7 +1498,8 @@ class OffloadingConnectorScheduler:
             if not entries:
                 continue
             req_status = self._req_status.get(req_id)
-            assert req_status is not None
+            if req_status is None or req_status.finished_signaled:
+                continue
             boundaries = {boundary for _, _, boundary in entries}
             assert len(boundaries) == 1
             boundary = boundaries.pop()
@@ -1653,7 +1654,7 @@ class OffloadingConnectorScheduler:
             scheduler_output.finished_req_ids or (),
         ):
             req_status = self._req_status.get(req_id)
-            if req_status is None:
+            if req_status is None or req_status.finished_signaled:
                 continue
             req = req_status.req
 
@@ -1976,8 +1977,9 @@ class OffloadingConnectorScheduler:
             req_status = self._req_status.get(req_id)
             if req_status is None:
                 continue
-            req_status.finished_signaled = True
-            self.manager.on_request_finished(req_status.req_context)
+            if not req_status.finished_signaled:
+                self.manager.on_request_finished(req_status.req_context)
+                req_status.finished_signaled = True
             if not req_status.transfer_jobs:
                 del self._req_status[req_id]
         self._current_batch_load_jobs = {}
@@ -2187,7 +2189,12 @@ class OffloadingConnectorScheduler:
             self._reset_cache()
 
     def _reset_cache(self) -> None:
-        # A rejected manager reset must leave scheduler bookkeeping intact.
+        # Finish parked producer jobs before draining, retaining request/job
+        # bookkeeping until reset succeeds so rejection remains recoverable.
+        for status in self._req_status.values():
+            if status.req.is_finished() and not status.finished_signaled:
+                self.manager.on_request_finished(status.req_context)
+                status.finished_signaled = True
         self.manager.reset_cache()
 
         # Flush all in-flight jobs
@@ -2195,8 +2202,6 @@ class OffloadingConnectorScheduler:
 
         for req_id, status in list(self._req_status.items()):
             if status.req.is_finished():
-                if not status.finished_signaled:
-                    self.manager.on_request_finished(status.req_context)
                 del self._req_status[req_id]
 
         # Reset store progress so active requests re-offload from chunk 0.
