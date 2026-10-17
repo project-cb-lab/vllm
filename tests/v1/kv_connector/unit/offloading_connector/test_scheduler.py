@@ -2918,6 +2918,8 @@ def test_reset_cache_finalizes_bound_p2p_store_before_drain():
         torch.zeros((5, 16), dtype=torch.int8).numpy()
     )
     primary = CPUPrimaryTierOffloadingManager(num_chunks=5, mmap_region=region)
+    producer.tier_type = "p2p"
+    producer._bp_detector = None
     manager = TieringOffloadingManager(primary, [producer], tier_poll_interval_s=0)
     producer_ctx = _req_context(_remote_decoder_kv_params())
     consumer_params = _remote_prefiller_kv_params("A", 1)
