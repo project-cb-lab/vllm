@@ -339,7 +339,7 @@ impl pb::control_server::Control for ControlServiceImpl {
         let clear_cache = request.clear_cache.unwrap_or(true);
         let _guard = self.rl_lock.lock().await;
         self.client()
-            .pause_scheduler(mode, clear_cache)
+            .pause_generation(mode, clear_cache)
             .await
             .map_err(|error| utility_status("pause_generation", error))?;
         Ok(Response::new(pb::PauseGenerationResponse {}))
@@ -532,9 +532,14 @@ pub(super) fn kv_event_source(response: &EngineCoreReadyResponse) -> Option<pb::
         replay_endpoint: config.replay_endpoint.clone().unwrap_or_default(),
         data_parallel_rank: Some(response.data_parallel_rank),
         encoding: "msgpack".to_string(),
-        schema_version: 1,
+        schema_version: if config.snapshot_endpoint.is_some() {
+            2
+        } else {
+            1
+        },
         buffer_steps: config.buffer_steps,
         hwm: config.hwm,
         max_queue_size: config.max_queue_size,
+        snapshot_endpoint: config.snapshot_endpoint.clone().unwrap_or_default(),
     })
 }

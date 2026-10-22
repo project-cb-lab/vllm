@@ -2885,7 +2885,7 @@ fn python_msgpack_fixtures_match_rust_encoding() {
                         new_prompt_logprobs_tensors: None,
                         pooling_output: None,
                         finish_reason: Some(
-                            Length,
+                            Error,
                         ),
                         stop_reason: None,
                         events: None,
@@ -2893,12 +2893,34 @@ fn python_msgpack_fixtures_match_rust_encoding() {
                         ec_transfer_params: None,
                         trace_headers: None,
                         prefill_stats: None,
-                        routed_experts: None,
+                        routed_experts: Some(
+                            WireArray {
+                                dtype: NumpyDtype {
+                                    scalar: U8,
+                                    endianness: Native,
+                                },
+                                shape: [
+                                    2,
+                                    1,
+                                    2,
+                                ],
+                                data: RawView(
+                                    b"\0\x01\x02\x03",
+                                ),
+                            },
+                        ),
                         num_nans_in_logits: 0,
                         mm_cache_miss_hashes: None,
                         new_sampling_mask: None,
                         spec_decode_metrics: None,
                         prompt_token_id_logprobs: None,
+                        error: Some(
+                            RequestError {
+                                code: "engine_paused",
+                                message: "Generation is paused.",
+                                retryable: true,
+                            },
+                        ),
                     },
                 ],
                 scheduler_stats: None,
@@ -3024,6 +3046,15 @@ fn python_msgpack_fixtures_match_rust_encoding() {
     assert_eq!(kv_events_config.buffer_steps, 10_000);
     assert_eq!(kv_events_config.hwm, 100_000);
     assert_eq!(kv_events_config.max_queue_size, 100_000);
+    assert_eq!(
+        kv_events_config.snapshot_endpoint.as_deref(),
+        Some("tcp://127.0.0.1:5559")
+    );
+    assert_eq!(kv_events_config.snapshot_max_blocks, Some(1_000_000));
+    assert_eq!(
+        kv_events_config.snapshot_max_response_bytes,
+        Some(256 * 1024 * 1024)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

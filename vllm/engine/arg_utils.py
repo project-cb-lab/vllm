@@ -68,6 +68,7 @@ from vllm.config import (
     StructuredOutputsConfig,
     UVAOffloadConfig,
     VllmConfig,
+    WatchdogConfig,
     WeightTransferConfig,
     get_attr_docs,
 )
@@ -508,7 +509,7 @@ class EngineArgs:
     load_format: str | LoadFormats = LoadConfig.load_format
     config_format: str = ModelConfig.config_format
     dtype: ModelDType = ModelConfig.dtype
-    kv_cache_dtype: CacheDType = CacheConfig.cache_dtype
+    kv_cache_dtype: CacheDType | str = CacheConfig.cache_dtype
     seed: int = ModelConfig.seed
     max_model_len: int = ModelConfig.max_model_len
     cudagraph_capture_sizes: list[int] | None = (
@@ -826,6 +827,7 @@ class EngineArgs:
     additional_config: dict[str, Any] = get_field(VllmConfig, "additional_config")
 
     use_tqdm_on_load: bool = LoadConfig.use_tqdm_on_load
+    release_weight_page_cache: bool = LoadConfig.release_weight_page_cache
     pt_load_map_location: str | dict[str, str] = LoadConfig.pt_load_map_location
 
     logits_processors: list[str | type[LogitsProcessor]] | None = (
@@ -853,6 +855,8 @@ class EngineArgs:
 
     shutdown_timeout: int = 0
 
+    watchdog_config: WatchdogConfig = get_field(VllmConfig, "watchdog_config")
+
     weight_transfer_config: WeightTransferConfig | None = get_field(
         VllmConfig,
         "weight_transfer_config",
@@ -860,7 +864,7 @@ class EngineArgs:
 
     fail_on_environ_validation: bool = False
     gdn_prefill_backend: (
-        Literal["flashinfer", "triton", "cutedsl", "aiter_flydsl"] | None
+        Literal["flashinfer", "triton", "cutedsl", "aiter_flydsl", "sycl"] | None
     ) = None
     kda_prefill_backend: (
         Literal["auto", "triton", "flashkda", "flashinfer", "fused"] | None
@@ -905,6 +909,9 @@ class EngineArgs:
             )
         if isinstance(self.ir_op_priority, dict):
             self.ir_op_priority = IrOpPriorityConfig(**self.ir_op_priority)
+
+        if isinstance(self.watchdog_config, dict):
+            self.watchdog_config = WatchdogConfig(**self.watchdog_config)
 
         from vllm.config.quantization import resolve_quantization_config
 
@@ -1084,6 +1091,10 @@ class EngineArgs:
         )
         load_group.add_argument("--ignore-patterns", **load_kwargs["ignore_patterns"])
         load_group.add_argument("--use-tqdm-on-load", **load_kwargs["use_tqdm_on_load"])
+        load_group.add_argument(
+            "--release-weight-page-cache",
+            **load_kwargs["release_weight_page_cache"],
+        )
         load_group.add_argument(
             "--pt-load-map-location", **load_kwargs["pt_load_map_location"]
         )
@@ -1890,6 +1901,7 @@ class EngineArgs:
             "--aux-output-config", **vllm_kwargs["aux_output_config"]
         )
         vllm_group.add_argument("--profiler-config", **vllm_kwargs["profiler_config"])
+        vllm_group.add_argument("--watchdog-config", **vllm_kwargs["watchdog_config"])
         vllm_group.add_argument(
             "--optimization-level", **vllm_kwargs["optimization_level"]
         )
@@ -1930,7 +1942,7 @@ class EngineArgs:
         parser.add_argument(
             "--gdn-prefill-backend",
             dest="gdn_prefill_backend",
-            choices=["flashinfer", "triton", "cutedsl", "aiter_flydsl"],
+            choices=["flashinfer", "triton", "cutedsl", "aiter_flydsl", "sycl"],
             default=None,
             help="Select GDN prefill backend.",
         )
@@ -2076,6 +2088,7 @@ class EngineArgs:
             model_loader_extra_config=self.model_loader_extra_config,
             ignore_patterns=self.ignore_patterns,
             use_tqdm_on_load=self.use_tqdm_on_load,
+            release_weight_page_cache=self.release_weight_page_cache,
             pt_load_map_location=self.pt_load_map_location,
         )
 
@@ -2891,6 +2904,7 @@ class EngineArgs:
             optimization_level=self.optimization_level,
             performance_mode=self.performance_mode,
             weight_transfer_config=self.weight_transfer_config,
+            watchdog_config=self.watchdog_config,
             shutdown_timeout=self.shutdown_timeout,
         )
 

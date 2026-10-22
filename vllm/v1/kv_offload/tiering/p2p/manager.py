@@ -7,6 +7,7 @@ Owns transports and a single bidirectional P2PSession per remote peer.
 
 from __future__ import annotations
 
+import contextlib
 import time
 import uuid
 from collections.abc import Iterable, Sequence
@@ -31,10 +32,12 @@ from vllm.v1.kv_offload.tiering.base import (
     JobResult,
     SecondaryTierManager,
     TransferJob,
+    UnsafeTransferError,
 )
 from vllm.v1.kv_offload.tiering.p2p.control import ControlTransport, ZmqTransport
 from vllm.v1.kv_offload.tiering.p2p.data import DataTransport, NixlTransport
 from vllm.v1.kv_offload.tiering.p2p.session import P2PSession
+from vllm.v1.kv_offload.tiering.p2p.session.protocol import TYPE_KEY, DisconnectMsg
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
 
 if TYPE_CHECKING:
@@ -73,6 +76,14 @@ _DRAIN_SLEEP_S = 0.001
 # many slots. Session setup is expensive; below this headroom, keep idle
 # peers so a later burst does not pay handshake again.
 _IDLE_REAP_HEADROOM = 8
+
+# Reconnect backoff after a session ends on a data-plane fault, as for
+# NixlConnector's invalid peers: the first fault reconnects at once; a
+# repeat within the max of the previous wait expiring doubles the wait.
+# Expiry is by time alone: no successful transfer is required, so a peer
+# that is merely idle for the max starts over at an immediate reconnect.
+_RECONNECT_MIN_BACKOFF_S = 1.0
+_RECONNECT_MAX_BACKOFF_S = 60.0
 
 
 def _remote_prefiller_params(kv_params: dict | None) -> dict | None:
@@ -354,6 +365,12 @@ class P2PSecondaryTierManager(SecondaryTierManager):
         self._control: ControlTransport = ZmqTransport(self._local_id, host, port)
 
         self._sessions: dict[str, P2PSession] = {}
+        # peer_id → (backoff, retry_at); see _schedule_reconnect_backoff.
+        self._reconnect_backoff: dict[str, tuple[float, float]] = {}
+        # peer_id → data-plane faults over this process's lifetime. Unlike
+        # the backoff it never expires, so the peer-down log shows a peer
+        # that keeps faulting under traffic too sparse to escalate.
+        self._data_plane_faults: dict[str, int] = {}
         # kv_request_id → session, set when the bound session has received
         # FetchMsg for that id. submit_store after binding routes directly
         # to the session; before binding, batches are parked in
@@ -615,7 +632,7 @@ class P2PSecondaryTierManager(SecondaryTierManager):
             len(block_ids),
             session.ready,
         )
-        session.request_blocks(job_id, kv_request_id, keys, block_ids)
+        session.request_blocks(job_id, kv_request_id, keys, block_ids.tolist())
 
     @override
     def get_finished_jobs(self) -> Iterable[JobResult]:
@@ -645,12 +662,21 @@ class P2PSecondaryTierManager(SecondaryTierManager):
         are NOT cancelled — the caller (``TieringOffloadingManager.reset_cache``)
         needs the primary memoryview to be quiescent, not aborted. Results
         accumulate in ``_finished_jobs`` and are surfaced by the next
-        ``get_finished_jobs()`` call.
+        ``get_finished_jobs()`` call. An unconfirmed unsafe failure raises
+        instead of waiting indefinitely for a terminal notification.
         """
         start = time.monotonic()
         warned = False
         while True:
             self._poll_once()
+            latest_safety = {
+                result.job_id: result.memory_safe for result in self._finished_jobs
+            }
+            if not all(latest_safety.values()):
+                raise UnsafeTransferError(
+                    "Cannot drain P2P jobs while remote WRITEs may still target "
+                    "quarantined slots."
+                )
             pending = any(s.has_pending_work for s in self._sessions.values())
             if not pending:
                 return
@@ -714,6 +740,8 @@ class P2PSecondaryTierManager(SecondaryTierManager):
         session = self._sessions.get(peer_id)
         if session is not None:
             return session
+        if self._reconnect_wait(peer_id) > 0:
+            return None
 
         max_peers = envs.VLLM_P2P_MAX_PEERS
         if len(self._sessions) >= max_peers:
@@ -770,6 +798,21 @@ class P2PSecondaryTierManager(SecondaryTierManager):
                 )
                 conn.close()
                 continue
+            wait = self._reconnect_wait(conn.peer_id)
+            if wait > 0:
+                logger.info(
+                    "P2P %s: rejecting inbound peer %s — reconnect backoff "
+                    "after a data-plane fault (%.1fs left)",
+                    self._local_id,
+                    conn.peer_id,
+                    wait,
+                )
+                # Tell the peer, so its lookups fall back now rather than
+                # at the handshake deadline.
+                with contextlib.suppress(Exception):
+                    conn.send({TYPE_KEY: DisconnectMsg.TYPE})
+                conn.close()
+                continue
             try:
                 existing = self._sessions.get(conn.peer_id)
                 if existing is not None:
@@ -816,7 +859,13 @@ class P2PSecondaryTierManager(SecondaryTierManager):
                 del self._kv_to_session[kid]
             close_result = session.close()
             for job_id in close_result.failed_jobs:
-                self._finished_jobs.append(JobResult(job_id=job_id, success=False))
+                self._finished_jobs.append(
+                    JobResult(
+                        job_id=job_id,
+                        success=False,
+                        memory_safe=job_id in close_result.memory_safe_jobs,
+                    )
+                )
             for job_id in close_result.failed_stores:
                 self._finished_jobs.append(JobResult(job_id=job_id, success=False))
             # Fail every client-side request (in-flight loads plus unresolved
@@ -828,7 +877,45 @@ class P2PSecondaryTierManager(SecondaryTierManager):
             # dead session's synthetic lookups on the next serve_external_requests.
             self._failed_serve_ctxs.extend(close_result.failed_serves)
             self._data.remove_remote_peer(pid)
-            logger.warning("P2P %s: peer %s down", self._local_id, pid)
+            fault_info = ""
+            if session.data_plane_fault is not None:
+                faults = self._data_plane_faults.get(pid, 0) + 1
+                self._data_plane_faults[pid] = faults
+                fault_info = f"; data-plane fault #{faults}"
+                backoff = self._schedule_reconnect_backoff(pid)
+                if backoff:
+                    fault_info += f"; reconnect backoff {backoff:.0f}s"
+            logger.warning(
+                "P2P %s: peer %s down (%s)%s",
+                self._local_id,
+                pid,
+                session.death_reason,
+                fault_info,
+            )
+
+    def _schedule_reconnect_backoff(self, peer_id: str) -> float:
+        """Record a data-plane fault for *peer_id*; return its reconnect wait.
+
+        The wait doubles (1 s up to the max) when the previous fault's wait
+        expired less than the max ago, and is 0 otherwise. Only time is
+        checked, not whether any transfer succeeded in between.
+        """
+        now = time.monotonic()
+        for pid, (_, retry_at) in list(self._reconnect_backoff.items()):
+            if now - retry_at > _RECONNECT_MAX_BACKOFF_S:
+                del self._reconnect_backoff[pid]
+        prev = self._reconnect_backoff.get(peer_id)
+        backoff = 0.0
+        if prev is not None:
+            backoff = min(
+                max(2 * prev[0], _RECONNECT_MIN_BACKOFF_S), _RECONNECT_MAX_BACKOFF_S
+            )
+        self._reconnect_backoff[peer_id] = (backoff, now + backoff)
+        return backoff
+
+    def _reconnect_wait(self, peer_id: str) -> float:
+        entry = self._reconnect_backoff.get(peer_id)
+        return 0.0 if entry is None else entry[1] - time.monotonic()
 
     def _reap_unbound_stores(self) -> None:
         """Time out submit_store batches that no peer has ever fetched.
@@ -914,7 +1001,13 @@ class P2PSecondaryTierManager(SecondaryTierManager):
                 del self._kv_to_session[kid]
             close_result = session.close()
             for job_id in close_result.failed_jobs:
-                self._finished_jobs.append(JobResult(job_id=job_id, success=False))
+                self._finished_jobs.append(
+                    JobResult(
+                        job_id=job_id,
+                        success=False,
+                        memory_safe=job_id in close_result.memory_safe_jobs,
+                    )
+                )
             for job_id in close_result.failed_stores:
                 self._finished_jobs.append(JobResult(job_id=job_id, success=False))
             self._failed_req_ids.update(close_result.failed_req_ids)
@@ -954,9 +1047,17 @@ class P2PSecondaryTierManager(SecondaryTierManager):
             result = session.poll()
             for lr in result.loads:
                 self._finished_jobs.append(
-                    JobResult(job_id=lr.job_id, success=lr.success)
+                    JobResult(
+                        job_id=lr.job_id,
+                        success=lr.success,
+                        memory_safe=lr.memory_safe,
+                    )
                 )
-                if not lr.success:
+                if (
+                    not lr.success
+                    and not lr.failure_reported
+                    and not lr.request_finished
+                ):
                     self._failed_req_ids.add(lr.kv_request_id)
             for sr in result.stores:
                 self._finished_jobs.append(

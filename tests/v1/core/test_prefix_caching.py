@@ -6184,25 +6184,34 @@ def test_mamba_reachable_block_mask_large_dcp_stays_sparse():
     assert mask_no_dcp == mask_large_dcp, "DCP must not change Mamba retention"
 
 
-def test_swa_shared_prefix_reuse_under_zero_retention():
+@pytest.mark.parametrize("use_eagle", [False, True])
+def test_swa_shared_prefix_reuse_under_zero_retention(use_eagle):
     """SWA cross-request analog: a partial shared prefix's sliding-window tail
     must stay reusable under ``prefix_cache_retention_interval=0``. Without
     the pin the junction window is masked out and a later request misses; with
-    it (and under dense) reuse is preserved."""
+    it (and under dense) reuse is preserved. With only the SWA group drafting
+    under EAGLE, the full group reports the junction at the shared prefix, but
+    the SWA hit lands one block below it: the block past the junction is not
+    shared and cannot serve as the EAGLE peek."""
     block_size = 16
 
     def last_req_hit(retention, pin):
+        config = _make_hybrid_kv_cache_config(
+            block_size, 200, ["full", "sliding_window"]
+        )
+        config.kv_cache_groups[1].is_eagle_group = use_eagle
         manager = make_kv_cache_manager(
-            _make_hybrid_kv_cache_config(block_size, 200, ["full", "sliding_window"]),
+            config,
             max_model_len=8192,
             enable_caching=True,
+            use_eagle=use_eagle,
             hash_block_size=block_size,
             retention_interval=retention,
         )
         shared = [7 for _ in range(4 * block_size)]  # 4-block shared prefix
 
         def distinct(v):
-            return [v for _ in range(2 * block_size)]
+            return [v for _ in range(4 * block_size)]
 
         # req0 primes the (dense) full-attention cache; SWA under RET=0 keeps
         # only its own replay window, not the shared-prefix boundary.
@@ -6225,12 +6234,13 @@ def test_swa_shared_prefix_reuse_under_zero_retention():
         _, nc2, _ = manager.get_computed_blocks(req2)
         return nc2
 
+    expected = (3 if use_eagle else 4) * block_size
     # Dense keeps every SWA tail -> reuse works (ceiling).
-    assert last_req_hit(retention=None, pin=False) == 4 * block_size
+    assert last_req_hit(retention=None, pin=False) == expected
     # retention=0 without the pin drops the junction window -> reuse lost (bug).
     assert last_req_hit(retention=0, pin=False) == 0
     # retention=0 with the pin keeps the junction window -> reuse restored.
-    assert last_req_hit(retention=0, pin=True) == 4 * block_size
+    assert last_req_hit(retention=0, pin=True) == expected
 
 
 def test_device_eviction_keeps_host_prefix():
@@ -6278,3 +6288,51 @@ def test_get_unhashed_block_ids_all_groups():
     )
 
     assert blocks.get_unhashed_block_ids_all_groups() == [[1, 4], []]
+
+
+def test_full_report_with_dcp_uses_effective_block_size():
+    """Full KV cache report must use the DCP-effective block size when
+    emitting BlockStored events for cached prefix blocks. Using the raw
+    physical page size triggers an assertion in resolve_block_hashes()
+    because hash blocks are sized at physical * dcp_world_size."""
+    physical_block_size = 64
+    dcp_size = 8
+    effective_block_size = physical_block_size * dcp_size
+
+    manager = make_kv_cache_manager(
+        make_kv_cache_config(physical_block_size, num_blocks=8),
+        max_model_len=8192,
+        scheduler_block_size=effective_block_size,
+        hash_block_size=effective_block_size,
+        enable_caching=True,
+        enable_kv_cache_events=True,
+        dcp_world_size=dcp_size,
+    )
+
+    token_ids = list(range(2 * effective_block_size))
+
+    # Prime the cache with a request.
+    prime = make_request("prime", token_ids, effective_block_size, sha256)
+    assert manager.allocate_slots(prime, len(token_ids)) is not None
+    prime_events = [e for e in manager.take_events() if isinstance(e, BlockStored)]
+    assert len(prime_events) > 0
+    prime_hashes = prime_events[0].block_hashes
+    manager.free(prime)
+
+    # Trigger the full report path with a prefix-hitting request.
+    trigger = make_request("trigger", token_ids, effective_block_size, sha256)
+    trigger.kv_cache_report_mode = "full"
+
+    # Before the fix this raised AssertionError in resolve_block_hashes().
+    manager.get_computed_blocks(trigger)
+
+    events = manager.take_events()
+    stored_events = [e for e in events if isinstance(e, BlockStored)]
+    assert len(stored_events) > 0
+    for event in stored_events:
+        assert event.block_size == effective_block_size
+        # Announced hashes for the reused prefix must match the hashes that
+        # were stored when the prefix was first cached. Hits stop at
+        # num_tokens - 1, so only complete prefix blocks are reported.
+        assert event.block_hashes == prime_hashes[: len(event.block_hashes)]
+        assert len(event.block_hashes) >= 1
