@@ -1390,6 +1390,57 @@ async fn unary_generate_invalid_sampling_params_returns_invalid_argument() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
+async fn unary_generate_invalid_structured_outputs_returns_invalid_argument() {
+    use pb::decoding_parameters::{StringChoices, StructuredOutput};
+
+    let (mut client, server_task, _engine_task) = grpc_test_server(
+        b"engine-grpc-invalid-structured-outputs",
+        default_stream_output_specs(),
+    )
+    .await;
+
+    for (structured_output, message) in [
+        (
+            StructuredOutput::Grammar("  ".to_string()),
+            "grammar cannot be an empty string",
+        ),
+        (
+            StructuredOutput::Choice(StringChoices { choices: vec![] }),
+            "choice cannot be empty",
+        ),
+        (
+            StructuredOutput::Regex("a\0b".to_string()),
+            "must not contain a NUL character",
+        ),
+        // xgrammar would accept this schema but ignore `uniqueItems`.
+        (
+            StructuredOutput::Json(r#"{"type": "array", "uniqueItems": true}"#.to_string()),
+            "not supported by xgrammar",
+        ),
+    ] {
+        let status = client
+            .generate(pb::GenerateRequest {
+                request_id: "test-invalid-structured-outputs".to_string(),
+                model: "test-model".to_string(),
+                prompt: Some(pb::generate_request::Prompt::Text("hi".to_string())),
+                decoding: Some(pb::DecodingParameters {
+                    structured_output: Some(structured_output),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .await
+            .expect_err("invalid structured outputs must be rejected before the engine");
+
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(status.message().contains(message), "{}", status.message());
+    }
+
+    server_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn streaming_generate_yields_incremental_responses() {
     let (mut client, server_task, engine_task) =
         grpc_test_server(b"engine-grpc-stream", default_stream_output_specs()).await;
@@ -2379,6 +2430,9 @@ fn kv_event_source_filters_and_exposes_zmq_publisher() {
         publisher: "null".to_string(),
         endpoint: "tcp://*:5559".to_string(),
         replay_endpoint: Some("tcp://*:5560".to_string()),
+        snapshot_endpoint: None,
+        snapshot_max_blocks: None,
+        snapshot_max_response_bytes: None,
         buffer_steps: 10_000,
         hwm: 100_000,
         max_queue_size: 100_000,
@@ -2401,6 +2455,13 @@ fn kv_event_source_filters_and_exposes_zmq_publisher() {
     assert_eq!(source.buffer_steps, 10_000);
     assert_eq!(source.hwm, 100_000);
     assert_eq!(source.max_queue_size, 100_000);
+    assert_eq!(source.snapshot_endpoint, "");
+
+    let config = ready.kv_events_config.as_mut().unwrap();
+    config.snapshot_endpoint = Some("tcp://10.0.0.2:5561".to_string());
+    let source = kv_event_source(&ready).expect("configured ZMQ event source");
+    assert_eq!(source.snapshot_endpoint, "tcp://10.0.0.2:5561");
+    assert_eq!(source.schema_version, 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

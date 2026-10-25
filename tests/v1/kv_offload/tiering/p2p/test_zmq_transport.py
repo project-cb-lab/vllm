@@ -4,17 +4,24 @@
 
 from __future__ import annotations
 
+import select
 import socket
 import time
 
 import pytest
 import zmq
 
+from vllm.v1.kv_offload.tiering.p2p.control import zmq as zmq_transport
 from vllm.v1.kv_offload.tiering.p2p.control.zmq import (
     ZmqConnection,
     ZmqTransport,
     _Sockets,
 )
+
+# Transports whose libzmq I/O thread is blocked. Terminating their context
+# blocks forever, and garbage collection would terminate it, so they stay
+# referenced until the interpreter exits (pyzmq skips the term at exit).
+_WEDGED_TRANSPORTS: list[ZmqTransport] = []
 
 
 def _free_port() -> int:
@@ -336,6 +343,148 @@ class TestZmqReconnect:
         finally:
             transport_a.close()
             transport_b.close()
+
+    def test_close_with_unsent_message_keeps_transport_usable(self, monkeypatch):
+        """A connection closed with an unsent message does not wedge the transport.
+
+        A closed DEALER that still holds a message keeps reconnecting to an
+        unresponsive peer, and its monitor events then block libzmq's I/O
+        thread, so no socket in the context can send or receive again.
+        """
+        monkeypatch.setattr(zmq_transport, "_HANDSHAKE_IVL_MS", 200)
+        # Accepts TCP connections but never answers the ZMTP greeting.
+        silent = socket.socket()
+        silent.bind(("127.0.0.1", 0))
+        silent.listen(8)
+        transport_a, port_a = _make_transport()
+        transport_b, _ = _make_transport()
+        wedged = True
+        try:
+            stale = transport_b.connect(f"127.0.0.1:{silent.getsockname()[1]}")
+            stale.send({"type": "stale"})
+            stale.close()
+            # Several ZMTP handshake timeouts on the closed DEALER.
+            time.sleep(1.0)
+
+            conn = transport_b.connect(f"127.0.0.1:{port_a}")
+            conn.send({"seq": 1})
+            inbound = _wait_for_inbound(transport_a)[0]
+            assert _wait_for_messages(transport_a, inbound, 1) == [{"seq": 1}]
+            wedged = False
+        finally:
+            transport_a.close()
+            silent.close()
+            if wedged:
+                _WEDGED_TRANSPORTS.append(transport_b)
+            else:
+                transport_b.close()
+
+    def test_close_while_connecting_keeps_transport_usable(self):
+        """Closing a connection whose TCP connect never completed keeps the
+        transport usable.
+
+        A peer address with no host behind it (a departed pod, a lost node)
+        never answers the SYN. Tearing down that connect raises EVENT_CLOSED
+        on libzmq's I/O thread, and a monitor event sent after its reader is
+        closed blocks that thread, so no socket in the context can send or
+        receive again.
+        """
+        # Linux drops SYNs to a listener whose accept queue is full, so a
+        # connect to it stays in progress like one to an address with no host.
+        full = socket.socket()
+        full.bind(("127.0.0.1", 0))
+        full.listen(0)
+        addr = full.getsockname()
+        filler = socket.create_connection(addr, timeout=1.0)
+        probe = socket.socket()
+        probe.setblocking(False)
+        probe.connect_ex(addr)
+        _, connected, _ = select.select([], [probe], [], 0.5)
+        probe.close()
+        if connected:
+            filler.close()
+            full.close()
+            pytest.skip("kernel completes connects to a full accept queue")
+
+        transport_a, port_a = _make_transport()
+        transport_b, _ = _make_transport()
+        wedged = True
+        try:
+            pending = transport_b.connect(f"127.0.0.1:{addr[1]}")
+            # Let the I/O thread start the TCP connect.
+            time.sleep(0.2)
+            pending.close()
+
+            conn = transport_b.connect(f"127.0.0.1:{port_a}")
+            conn.send({"seq": 1})
+            inbound = _wait_for_inbound(transport_a)[0]
+            assert _wait_for_messages(transport_a, inbound, 1) == [{"seq": 1}]
+            wedged = False
+        finally:
+            transport_a.close()
+            filler.close()
+            full.close()
+            if wedged:
+                _WEDGED_TRANSPORTS.append(transport_b)
+            else:
+                transport_b.close()
+
+
+class TestUnreachablePeer:
+    """An outbound connection to a peer that cannot be reached dies within
+    seconds, so its session falls back instead of waiting out the session
+    handshake deadline."""
+
+    # The connect or greeting deadline plus polling slack.
+    DEADLINE_S = 5.0
+
+    def _dies_within_deadline(self, transport: ZmqTransport, conn) -> bool:
+        end = time.monotonic() + self.DEADLINE_S
+        while conn.alive and time.monotonic() < end:
+            transport.poll()
+            time.sleep(0.05)
+        return not conn.alive
+
+    def test_connect_that_never_completes_marks_connection_dead(self):
+        # Linux drops SYNs to a listener whose accept queue is full, so a
+        # connect to it stays in progress like one to an address with no host.
+        full = socket.socket()
+        full.bind(("127.0.0.1", 0))
+        full.listen(0)
+        addr = full.getsockname()
+        filler = socket.create_connection(addr, timeout=1.0)
+        probe = socket.socket()
+        probe.setblocking(False)
+        probe.connect_ex(addr)
+        _, connected, _ = select.select([], [probe], [], 0.5)
+        probe.close()
+        if connected:
+            filler.close()
+            full.close()
+            pytest.skip("kernel completes connects to a full accept queue")
+
+        transport, _ = _make_transport()
+        try:
+            conn = transport.connect(f"127.0.0.1:{addr[1]}")
+            assert self._dies_within_deadline(transport, conn)
+        finally:
+            transport.close()
+            filler.close()
+            full.close()
+
+    def test_peer_that_never_sends_greeting_marks_connection_dead(self):
+        # Accepts TCP connections but never sends the ZMTP greeting, like a
+        # process whose libzmq I/O thread is blocked.
+        silent = socket.socket()
+        silent.bind(("127.0.0.1", 0))
+        silent.listen(8)
+        transport, _ = _make_transport()
+        try:
+            conn = transport.connect(f"127.0.0.1:{silent.getsockname()[1]}")
+            assert self._dies_within_deadline(transport, conn)
+        finally:
+            transport.close()
+            silent.close()
 
 
 class TestExpandedMonitorEvents:

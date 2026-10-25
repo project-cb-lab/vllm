@@ -13,7 +13,7 @@ import torch
 from torch import nn
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
-from vllm.config import ModelConfig
+from vllm.config import ModelConfig, get_current_vllm_config_or_none
 from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
@@ -37,6 +37,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     multi_thread_safetensors_weights_iterator,
     np_cache_weights_iterator,
     pt_weights_iterator,
+    record_checkpoint_files,
     resolve_mm_encoder_only_lm_prefixes,
     safetensors_weights_iterator,
 )
@@ -298,6 +299,8 @@ class DefaultModelLoader(BaseModelLoader):
             hf_weights_files = filter_safetensors_files_by_weight_name(
                 hf_weights_files, source.is_unused_weight
             )
+        if self.load_config.release_weight_page_cache:
+            record_checkpoint_files(hf_weights_files)
         if self.load_config.load_format == "npcache":
             # Currently np_cache only support *.bin checkpoints
             assert use_safetensors is False
@@ -315,10 +318,15 @@ class DefaultModelLoader(BaseModelLoader):
                     self.load_config.use_tqdm_on_load,
                 )
             elif self.load_config.load_format == "instanttensor":
+                vllm_config = get_current_vllm_config_or_none()
+                engram_config = vllm_config.engram_config if vllm_config else None
                 weights_iterator = instanttensor_weights_iterator(
                     hf_weights_files,
                     self.load_config.use_tqdm_on_load,
                     local_expert_ids=self.local_expert_ids,
+                    load_engram_on_cpu=bool(
+                        engram_config and engram_config.cpu_offload
+                    ),
                 )
             else:
                 if extra_config.get("enable_multithread_load"):

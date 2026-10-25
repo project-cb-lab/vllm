@@ -227,6 +227,8 @@ def _mp_barrier_construct_and_hold(
         if not replicated or rank == 0:
             t[:, :] = fill_value
         barrier.wait(30)
+        # fd is only cleared by cleanup(), which this holder never calls.
+        assert region.fd is not None
         done_queue.put(
             {
                 "rank": rank,
@@ -423,6 +425,7 @@ def test_create_next_worker_view_multiprocess_slots(iid):
         result = done_queue.get(timeout=30)
         assert result["error"] is None, result["error"]
 
+        assert region.mmap_obj is not None
         raw = memoryview(region.mmap_obj)
         for chunk in range(num_chunks):
             row_start = chunk * num_workers * PAGE_SIZE
@@ -688,6 +691,50 @@ def test_segmented_region_maps_files_back_to_back(iid, monkeypatch):
     assert not any(os.path.exists(path) for path, _, _ in segments)
 
 
+@pytest.mark.parametrize("num_segments", [1, 3])
+def test_single_chunk_segments_preserve_shared_canonical_views(
+    iid, monkeypatch, num_segments
+):
+    """Backing boundaries must not change flat HiSparse views or peer writes."""
+    monkeypatch.setattr(region_module, "_MIN_SEGMENT_BYTES", PAGE_SIZE)
+    huge_page = 2 << 20
+    pool_bytes = 5 * huge_page + PAGE_SIZE
+    regions = [
+        SharedOffloadRegion(
+            engine_id=iid,
+            num_chunks=1,
+            rank=0,
+            kv_bytes_per_chunk=pool_bytes,
+            cpu_page_size=pool_bytes,
+            num_segments=num_segments,
+        )
+        for _ in range(2)
+    ]
+    paths = [path for path, _, _ in regions[0]._segments]
+    try:
+        assert len(paths) == num_segments
+        segments = regions[0]._segments
+        assert all(offset % huge_page == 0 for _, offset, _ in segments)
+        assert sum(length for _, _, length in segments) == pool_bytes
+        if num_segments > 1:
+            assert [length for _, _, length in segments] == [
+                2 * huge_page,
+                2 * huge_page,
+                huge_page + PAGE_SIZE,
+            ]
+        a = regions[0].create_next_canonical_view(pool_bytes)
+        b = regions[1].create_next_canonical_view(pool_bytes)
+        a.fill_(17)
+        assert (b == 17).all()
+        b[2 * huge_page - 1 : 2 * huge_page + 1] = 29
+        assert (a[2 * huge_page - 1 : 2 * huge_page + 1] == 29).all()
+        del a, b
+    finally:
+        for region in regions:
+            region.cleanup()
+    assert not any(os.path.exists(path) for path in paths)
+
+
 # ---------------------------------------------------------------------------
 # Multi-worker race — concurrent construction
 # ---------------------------------------------------------------------------
@@ -709,6 +756,7 @@ def test_multi_worker_race_exactly_one_creator(iid):
         )
 
         for r in regions:
+            assert r.mmap_obj is not None
             assert not r.mmap_obj.closed
             assert r.total_size_bytes == 4 * num_workers * PAGE_SIZE
     finally:
@@ -723,8 +771,11 @@ def test_multi_worker_race_shared_memory_visible(iid):
     regions, errors = _race_construct(iid, num_workers=num_workers)
     assert not errors
     try:
-        regions[0].mmap_obj[0:1] = b"\xab"
+        writer_mmap = regions[0].mmap_obj
+        assert writer_mmap is not None
+        writer_mmap[0:1] = b"\xab"
         for r in regions[1:]:
+            assert r.mmap_obj is not None
             assert memoryview(r.mmap_obj)[0:1] == b"\xab"
     finally:
         for r in regions:
@@ -800,8 +851,11 @@ def test_cleanup_creator_all_effects(iid):
     """cleanup() on the creator closes mmap, closes fd, and removes the file."""
     r = _make_region(iid)
     path = r.mmap_path
+    # captured before cleanup(), which clears both attributes on the region
     fd = r.fd
     mmap_obj = r.mmap_obj
+    assert fd is not None
+    assert mmap_obj is not None
 
     r.cleanup()
 
@@ -816,8 +870,11 @@ def test_cleanup_non_creator_all_effects(iid):
     r0 = _make_region(iid)  # creator
     r1 = _make_region(iid)  # joiner
     path = r0.mmap_path
+    # captured before cleanup(), which clears both attributes on the region
     fd1 = r1.fd
     mmap_obj1 = r1.mmap_obj
+    assert fd1 is not None
+    assert mmap_obj1 is not None
     try:
         r1.cleanup()
 
@@ -1031,7 +1088,8 @@ def test_cleanup_after_create_next_worker_view_releases_mmap(iid):
     create_next_worker_view returns a view that shares storage with _base; both must be
     released before mmap.close() can succeed."""
     r = _make_region(iid)
-    mmap_obj = r.mmap_obj
+    mmap_obj = r.mmap_obj  # captured before cleanup() clears it
+    assert mmap_obj is not None
 
     t = r.create_next_worker_view(PAGE_SIZE)
     del t
@@ -1218,7 +1276,7 @@ def test_cleanup_keeps_region_mapped_while_buffers_are_exported(iid):
         assert region.mmap_obj[0:1] == b"\x00", "mapping must stay readable"
     finally:
         del export
-        region.mmap_obj.close()
+        region.mmap_obj.close()  # type: ignore[union-attr]
         _cleanup_file(region.mmap_path)
 
 
@@ -1237,6 +1295,7 @@ def test_backing_file_unlinked_after_barrier(iid):
         assert region._creator is False, "nothing left for cleanup() to unlink"
         t = region.create_next_worker_view(PAGE_SIZE)
         t[:, :] = 7
+        assert region.mmap_obj is not None
         assert memoryview(region.mmap_obj)[0] == 7, "mapping must stay valid"
         del t
     finally:
