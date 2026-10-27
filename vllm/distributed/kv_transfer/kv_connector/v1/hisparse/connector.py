@@ -156,6 +156,7 @@ class HiSparseConnectorScheduler:
             )
             for request_id, start, count in scheduled_requests
         )
+        self.coordinator.sched_step_seq += 1
         command = self.coordinator.build_offload_command()
         host_block_copies = self.coordinator.take_host_block_copies()
         source_group_id = self.coordinator.host_group_id
@@ -201,6 +202,7 @@ class HiSparseConnectorScheduler:
 
     def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
         assert self.coordinator is not None
+        self.coordinator.step_processed()
         for request_id in connector_output.finished_recving or ():
             self.coordinator.finish_host_import(
                 request_id, failed=request_id in connector_output.failed_recving
@@ -378,6 +380,14 @@ class HiSparseConnector(KVConnectorBase_V1, SupportsHMA):
         self, request: Request, num_computed_tokens: int
     ) -> tuple[int | None, bool]:
         return 0, False
+
+    def on_new_request(self, request: Request) -> None:
+        assert self.connector_scheduler is not None
+        coordinator = self.connector_scheduler.coordinator
+        assert coordinator is not None
+        params = request.kv_transfer_params
+        if params and params.get("do_remote_prefill"):
+            coordinator.defer_unpins = True
 
     def update_state_after_alloc(
         self,
