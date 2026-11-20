@@ -975,6 +975,7 @@ class BaseRenderer(ABC, Generic[_T]):
         media_io_kwargs: Mapping[str, Mapping[str, object]] | None = None,
         *,
         skip_mm_cache: bool = False,
+        routing_metadata_only: bool = False,
     ) -> "MultiModalInput":
         self._drain_mm_cache_invalidations()
         mm_processor = self.get_mm_processor()
@@ -1003,7 +1004,12 @@ class BaseRenderer(ABC, Generic[_T]):
         mm_timing_ctx = self._mm_timing_registry.get(mm_req_id)
 
         with set_default_torch_num_threads():
-            mm_inputs = mm_processor.apply(mm_processor_inputs, mm_timing_ctx)
+            if routing_metadata_only:
+                mm_inputs = mm_processor.apply_routing_metadata(
+                    mm_processor_inputs, mm_timing_ctx
+                )
+            else:
+                mm_inputs = mm_processor.apply(mm_processor_inputs, mm_timing_ctx)
 
         self.update_mm_cache_stats()
 
@@ -1029,6 +1035,7 @@ class BaseRenderer(ABC, Generic[_T]):
                 mm_uuids=prompt.get("multi_modal_uuids"),
                 media_io_kwargs=prompt.get("media_io_kwargs"),
                 skip_mm_cache=skip_mm_cache,
+                routing_metadata_only=prompt.get("routing_metadata_only", False),
             )
         else:
             engine_input = tokens_input(prompt_token_ids)
@@ -1096,6 +1103,7 @@ class BaseRenderer(ABC, Generic[_T]):
                 mm_uuids=prompt.get("multi_modal_uuids"),
                 media_io_kwargs=prompt.get("media_io_kwargs"),
                 skip_mm_cache=skip_mm_cache,
+                routing_metadata_only=prompt.get("routing_metadata_only", False),
             )
         else:
             engine_input = tokens_input(prompt_token_ids)

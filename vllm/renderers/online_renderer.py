@@ -244,6 +244,7 @@ class OnlineRenderer:
         request: ChatCompletionRequest,
         *,
         skip_mm_cache: bool = False,
+        routing_metadata_only: bool = False,
     ) -> tuple[list[ConversationMessage], list[EngineInput]] | ErrorResponse:
         """Core preprocessing logic for chat requests (no model/engine check).
 
@@ -324,6 +325,7 @@ class OnlineRenderer:
                 tool_dicts=tool_dicts,
                 parser=self.parser,
                 skip_mm_cache=skip_mm_cache,
+                routing_metadata_only=routing_metadata_only,
             )
         else:
             # For GPT-OSS.
@@ -348,6 +350,7 @@ class OnlineRenderer:
         previous_response_outputs: list[ResponseOutputItem] | None = None,
         tool_server: "ToolServer | None" = None,
         skip_mm_cache: bool = False,
+        routing_metadata_only: bool = False,
     ) -> ResponsesRenderResult | ErrorResponse:
         """Render a Responses request using only explicitly supplied history."""
         template_error = self.validate_chat_template(
@@ -402,6 +405,7 @@ class OnlineRenderer:
             tool_dicts=tool_dicts,
             parser=self.parser,
             skip_mm_cache=skip_mm_cache,
+            routing_metadata_only=routing_metadata_only,
         )
         return self._responses_render_result(messages, engine_inputs)
 
@@ -618,6 +622,7 @@ class OnlineRenderer:
         request: CompletionRequest,
         *,
         skip_mm_cache: bool = False,
+        routing_metadata_only: bool = False,
     ) -> list[EngineInput] | ErrorResponse:
         """Core preprocessing logic for completion requests (no model/engine check).
 
@@ -691,6 +696,7 @@ class OnlineRenderer:
             prompt_input=prompt_input,
             prompt_embeds=request.prompt_embeds,
             skip_mm_cache=skip_mm_cache,
+            routing_metadata_only=routing_metadata_only,
         )
 
         observe_request_render_duration(
@@ -737,6 +743,7 @@ class OnlineRenderer:
         prompt_embeds: bytes | list[bytes] | None,
         *,
         skip_mm_cache: bool = False,
+        routing_metadata_only: bool = False,
     ) -> list[EngineInput]:
         """Copied from GenerateBaseServing._preprocess_completion."""
         prompts = list[SingletonPrompt | bytes]()
@@ -744,7 +751,12 @@ class OnlineRenderer:
             prompts.extend(prompt_to_seq(prompt_embeds))
         if prompt_input is not None:
             prompts.extend(prompt_to_seq(prompt_input))
-        return await self.preprocess_cmpl(request, prompts, skip_mm_cache=skip_mm_cache)
+        return await self.preprocess_cmpl(
+            request,
+            prompts,
+            skip_mm_cache=skip_mm_cache,
+            routing_metadata_only=routing_metadata_only,
+        )
 
     async def preprocess_cmpl(
         self,
@@ -752,6 +764,7 @@ class OnlineRenderer:
         prompts: Sequence[PromptType | bytes],
         *,
         skip_mm_cache: bool = False,
+        routing_metadata_only: bool = False,
     ) -> list[EngineInput]:
         """Copied from GenerateBaseServing._preprocess_cmpl."""
         renderer = self.renderer
@@ -776,9 +789,12 @@ class OnlineRenderer:
             parsed_prompts,
             tok_params,
             prompt_extras={
-                k: v
-                for k in ("mm_processor_kwargs", "cache_salt")
-                if (v := getattr(request, k, None)) is not None
+                **{
+                    k: v
+                    for k in ("mm_processor_kwargs", "cache_salt")
+                    if (v := getattr(request, k, None)) is not None
+                },
+                "routing_metadata_only": routing_metadata_only,
             },
             skip_mm_cache=skip_mm_cache,
         )
@@ -794,6 +810,7 @@ class OnlineRenderer:
         parser: type[Parser] | None = None,
         *,
         skip_mm_cache: bool = False,
+        routing_metadata_only: bool = False,
     ) -> tuple[list[ConversationMessage], list[EngineInput]]:
         """Copied from GenerateBaseServing._preprocess_chat."""
         renderer = self.renderer
@@ -843,9 +860,12 @@ class OnlineRenderer:
                 chat_params,
                 tok_params,
                 prompt_extras={
-                    k: v
-                    for k in ("mm_processor_kwargs", "cache_salt")
-                    if (v := getattr(request, k, None)) is not None
+                    **{
+                        k: v
+                        for k in ("mm_processor_kwargs", "cache_salt")
+                        if (v := getattr(request, k, None)) is not None
+                    },
+                    "routing_metadata_only": routing_metadata_only,
                 },
                 skip_mm_cache=skip_mm_cache,
             )
