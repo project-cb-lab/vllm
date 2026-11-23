@@ -157,6 +157,7 @@ class Inkling2DecoderLayer(nn.Module):
             kernel_size=config.sconv_kernel_size,
             prefix=f"{prefix}.conv_state",
             replicate_hidden=True,
+            sparse_history=True,
         )
         self.attn = Inkling2Attention(
             config, self.is_local, self.conv_state, prefix=f"{prefix}.attn"
