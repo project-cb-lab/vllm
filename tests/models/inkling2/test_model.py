@@ -54,6 +54,43 @@ TINY_CONFIG = {
 }
 
 
+@pytest.mark.parametrize(
+    ("ubatch_size", "enable_dbo", "sparse"),
+    [(1, False, True), (2, False, False), (1, True, False)],
+)
+def test_short_conv_cache_policy_for_microbatches(
+    tmp_path, dist_init, ubatch_size, enable_dbo, sparse
+):
+    from vllm.config import ModelConfig, VllmConfig, set_current_vllm_config
+    from vllm.models.inkling.nvidia.sconv_swa_attn import InklingConvState
+    from vllm.v1.core.single_type_kv_cache_manager import (
+        ShortConvStateManager,
+        SlidingWindowManager,
+    )
+
+    (tmp_path / "config.json").write_text(json.dumps(TINY_CONFIG))
+    config = VllmConfig(
+        model_config=ModelConfig(
+            model=str(tmp_path), dtype="bfloat16", skip_tokenizer_init=True
+        )
+    )
+    config.parallel_config.ubatch_size = ubatch_size
+    config.parallel_config.enable_dbo = enable_dbo
+    with set_current_vllm_config(config):
+        state = InklingConvState(
+            num_kv_heads=2,
+            head_dim=128,
+            hidden_size=512,
+            kernel_size=4,
+            prefix="conv",
+            sparse_history=True,
+        )
+        policy = state.get_kv_cache_config(config)
+    assert policy.manager_cls is (
+        ShortConvStateManager if sparse else SlidingWindowManager
+    )
+
+
 @pytest.mark.parametrize("draft_sample_method", [None, "greedy", "probabilistic"])
 def test_tiny_model_generates(tmp_path, draft_sample_method):
     """One local and one full layer load (dummy weights) and decode with the
