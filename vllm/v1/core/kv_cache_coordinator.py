@@ -293,8 +293,11 @@ class KVCacheCoordinator(ABC):
         boundaries = (
             *replay_boundaries(
                 request.num_prompt_tokens,
+                self.scheduler_block_size,
+                use_eagle=bool(self.drop_eagle_group_ids),
                 num_hash_lookahead_tokens=self.block_pool.num_hash_lookahead_tokens,
             ),
+            request.num_prompt_tokens,
             request.shared_prefix_boundary,
         )
         for manager in self._boundary_tracking_managers:

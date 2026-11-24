@@ -1765,6 +1765,11 @@ class ShortConvStateManager(DFlashSlidingWindowManager):
     def set_reachable_boundaries(
         self, request_id: str, boundaries: Sequence[int]
     ) -> None:
+        if self.use_eagle:
+            # An EAGLE sibling diverging at a boundary hits one block lower.
+            boundaries = (*boundaries, *(
+                b - self.block_size for b in boundaries if b > self.block_size
+            ))
         self._reachable_boundaries[request_id] = tuple(boundaries)
 
     def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
@@ -1790,6 +1795,7 @@ class ShortConvStateManager(DFlashSlidingWindowManager):
             alignment_tokens=self.cache_hit_alignment_tokens,
             block_size=self.group_block_size,
             manager_config=self.manager_config,
+            use_eagle=self.use_eagle,
             retention_interval=0,
             reachable_boundaries=self._reachable_boundaries.get(request_id, ()),
         )
